@@ -1,636 +1,559 @@
+import logging
 import os
 import pickle
-import warnings
+from pathlib import Path
 
-import numpy as np
-from flask import Flask, jsonify, request
+import pandas as pd
+from flask import Flask, jsonify, render_template_string, request
 
-warnings.filterwarnings("ignore")
+BASE_DIR = Path(__file__).resolve().parent
+MODEL_PATH = Path(os.environ.get("MODEL_PATH", BASE_DIR / "logistic.pkl"))
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("loan-app")
 
 app = Flask(__name__)
+# AWS Elastic Beanstalk looks for a WSGI callable named "application" by default.
+application = app
 
-# ---------------------------------------------------------------------------
-# Load model (path is relative to this file so it works on Vercel too)
-# ---------------------------------------------------------------------------
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_PATH = os.path.join(BASE_DIR, "logistic.pkl")
+# --------------------------------------------------------------------------- #
+# Model
+# --------------------------------------------------------------------------- #
+with open(MODEL_PATH, "rb") as fh:
+    model = pickle.load(fh)
 
-with open(MODEL_PATH, "rb") as f:
-    model = pickle.load(f)
+FEATURE_ORDER = list(
+    getattr(
+        model,
+        "feature_names_in_",
+        [
+            "Gender", "Married", "Dependents", "Education", "Self_Employed",
+            "ApplicantIncome", "CoapplicantIncome", "LoanAmount",
+            "Loan_Amount_Term", "Credit_History", "Property_Area",
+        ],
+    )
+)
+log.info("Model loaded from %s with features: %s", MODEL_PATH, FEATURE_ORDER)
 
-# Model input order:
-# Gender, Married, Dependents, Education, Self_Employed, ApplicantIncome,
-# CoapplicantIncome, LoanAmount, Loan_Amount_Term, Credit_History, Property_Area
-#
-# Categorical values were label-encoded alphabetically during training:
-GENDER_MAP = {"female": 0, "male": 1}
-MARRIED_MAP = {"no": 0, "yes": 1}
-EDUCATION_MAP = {"graduate": 0, "not_graduate": 1}
-SELF_EMP_MAP = {"no": 0, "yes": 1}
-AREA_MAP = {"rural": 0, "semiurban": 1, "urban": 2}
-AREA_NAME = {"rural": "rural", "semiurban": "semi-urban", "urban": "urban"}
-DEPENDENTS_ALLOWED = {"0", "1", "2", "3"}  # "3" means 3 or more
+# --------------------------------------------------------------------------- #
+# Input encoding
+# IMPORTANT: these numeric codes must match how the data was encoded when the
+# model was trained. If your notebook used different codes, edit them here.
+# --------------------------------------------------------------------------- #
+CATEGORICAL = {
+    "Gender": {"Male": 1, "Female": 0},
+    "Married": {"Yes": 1, "No": 0},
+    "Dependents": {"0": 0, "1": 1, "2": 2, "3+": 3},
+    "Education": {"Graduate": 1, "Not Graduate": 0},
+    "Self_Employed": {"Yes": 1, "No": 0},
+    "Credit_History": {"1": 1.0, "0": 0.0},
+    "Property_Area": {"Rural": 0, "Semiurban": 1, "Urban": 2},
+}
 
-# Index of the class "approved" (1) in the model output
-APPROVED_IDX = list(model.classes_).index(1)
-
-
-def indian_format(n: float) -> str:
-    """Format a number with Indian digit grouping, e.g. 4,65,56,100."""
-    s = str(int(round(n)))
-    if len(s) <= 3:
-        return s
-    last3, rest = s[-3:], s[:-3]
-    groups = []
-    while len(rest) > 2:
-        groups.insert(0, rest[-2:])
-        rest = rest[:-2]
-    if rest:
-        groups.insert(0, rest)
-    return ",".join(groups + [last3])
-
-
-def money(x: float) -> str:
-    return "\u20b9" + indian_format(x)
-
-
-def money_words(x: float) -> str:
-    """Easy-to-read form: '₹3.88 Crore' / '₹45.20 Lakh'."""
-    if x >= 1e7:
-        return f"\u20b9{x / 1e7:.2f} Crore"
-    if x >= 1e5:
-        return f"\u20b9{x / 1e5:.2f} Lakh"
-    return money(x)
+# field -> (minimum, maximum, label used in error messages)
+NUMERIC = {
+    "ApplicantIncome": (0, 1_000_000, "Applicant income"),
+    "CoapplicantIncome": (0, 1_000_000, "Co-applicant income"),
+    "LoanAmount": (1, 10_000, "Loan amount"),
+    "Loan_Amount_Term": (12, 480, "Loan term"),
+}
 
 
-def term_text(months: int) -> str:
-    if months % 12 == 0:
-        y = months // 12
-        return f"{y} year{'s' if y != 1 else ''}"
-    return f"{months} months"
+def parse_payload(payload):
+    """Validate raw input and return (feature_row, errors)."""
+    row, errors = {}, {}
+
+    for field, mapping in CATEGORICAL.items():
+        value = str(payload.get(field, "")).strip()
+        if value in mapping:
+            row[field] = mapping[value]
+        else:
+            errors[field] = "Choose an option."
+
+    for field, (low, high, label) in NUMERIC.items():
+        raw = payload.get(field)
+        try:
+            number = float(raw)
+        except (TypeError, ValueError):
+            errors[field] = f"{label} must be a number."
+            continue
+        if not low <= number <= high:
+            errors[field] = f"{label} must be between {low:,} and {high:,}."
+        else:
+            row[field] = number
+
+    return row, errors
 
 
-def approval_probability(row) -> float:
-    x = np.array([row], dtype=float)
-    return float(model.predict_proba(x)[0][APPROVED_IDX])
-
-
-# ---------------------------------------------------------------------------
-# Frontend (single page, light + dark theme)
-# ---------------------------------------------------------------------------
-HTML = r"""<!DOCTYPE html>
+# --------------------------------------------------------------------------- #
+# Web page (HTML, CSS and JS in one place so the project needs only app.py)
+# --------------------------------------------------------------------------- #
+PAGE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Loan Approval Predictor</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-<style>
-  :root {
-    --bg: #f4f7fb;
-    --bg-accent: radial-gradient(1200px 500px at 8% -10%, #d9e8ff 0%, transparent 60%),
-                 radial-gradient(900px 500px at 100% 0%, #d8f5e8 0%, transparent 55%);
-    --card: #ffffff;
-    --text: #0f172a;
-    --muted: #64748b;
-    --border: #e2e8f0;
-    --input-bg: #f8fafc;
-    --primary: #2563eb;
-    --primary-2: #06b6d4;
-    --primary-soft: #eaf1ff;
-    --good: #059669;
-    --good-soft: #e7f8f0;
-    --mid: #d97706;
-    --mid-soft: #fff6e5;
-    --bad: #dc2626;
-    --bad-soft: #fdecec;
-    --track: #e2e8f0;
-    --shadow: 0 10px 30px rgba(15, 23, 42, .08);
-  }
-  :root[data-theme="dark"] {
-    --bg: #0a1120;
-    --bg-accent: radial-gradient(1200px 500px at 8% -10%, #10264f 0%, transparent 60%),
-                 radial-gradient(900px 500px at 100% 0%, #0d2d2a 0%, transparent 55%);
-    --card: #101a2e;
-    --text: #e7edf8;
-    --muted: #8fa1c0;
-    --border: #1f2d4a;
-    --input-bg: #0b1424;
-    --primary: #60a5fa;
-    --primary-2: #22d3ee;
-    --primary-soft: #14284a;
-    --good: #34d399;
-    --good-soft: #0f2d25;
-    --mid: #fbbf24;
-    --mid-soft: #2e2510;
-    --bad: #f87171;
-    --bad-soft: #2f1719;
-    --track: #1f2d4a;
-    --shadow: 0 10px 30px rgba(0, 0, 0, .5);
-  }
-  * { box-sizing: border-box; }
-  html, body { margin: 0; }
-  body {
-    font-family: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-    background: var(--bg); background-image: var(--bg-accent); background-attachment: fixed;
-    color: var(--text); min-height: 100vh; line-height: 1.5;
-    transition: background .25s, color .25s;
-  }
-  .wrap { max-width: 1040px; margin: 0 auto; padding: 28px 18px 60px; }
-  header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 26px; }
-  .brand { display: flex; align-items: center; gap: 12px; }
-  .logo {
-    width: 42px; height: 42px; border-radius: 12px; display: grid; place-items: center;
-    background: linear-gradient(135deg, var(--primary), var(--primary-2)); color: #fff;
-  }
-  .brand h1 { font-size: 1.15rem; margin: 0; letter-spacing: -.01em; }
-  .brand p { margin: 0; font-size: .8rem; color: var(--muted); }
-  .theme-btn {
-    border: 1px solid var(--border); background: var(--card); color: var(--text);
-    width: 42px; height: 42px; border-radius: 12px; cursor: pointer; display: grid; place-items: center;
-    box-shadow: var(--shadow); transition: transform .15s;
-  }
-  .theme-btn:hover { transform: translateY(-1px); }
-  .grid { display: grid; grid-template-columns: 1.3fr 1fr; gap: 20px; align-items: start; }
-  @media (max-width: 860px) { .grid { grid-template-columns: 1fr; } }
-  .card {
-    background: var(--card); border: 1px solid var(--border); border-radius: 18px;
-    padding: 24px; box-shadow: var(--shadow); transition: background .25s, border-color .25s;
-  }
-  .card h2 { margin: 0 0 4px; font-size: 1.05rem; }
-  .card .sub { margin: 0 0 8px; color: var(--muted); font-size: .88rem; }
-  .section-title {
-    display: flex; align-items: center; gap: 8px; margin: 22px 0 12px; font-size: .78rem; font-weight: 700;
-    letter-spacing: .08em; text-transform: uppercase; color: var(--primary);
-  }
-  .section-title::after { content: ""; flex: 1; height: 1px; background: var(--border); }
-  .fields { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
-  @media (max-width: 540px) { .fields { grid-template-columns: 1fr; } }
-  .field.full { grid-column: 1 / -1; }
-  .lbl { display: block; font-size: .82rem; font-weight: 600; margin-bottom: 6px; }
-  .lbl small { color: var(--muted); font-weight: 500; }
-  .hint { font-size: .74rem; color: var(--muted); margin-top: 5px; }
-  input[type=number], select {
-    width: 100%; padding: 11px 13px; font: inherit; color: var(--text);
-    background: var(--input-bg); border: 1px solid var(--border); border-radius: 10px; outline: none;
-    transition: border-color .15s, box-shadow .15s;
-  }
-  input[type=number]:focus, select:focus { border-color: var(--primary); box-shadow: 0 0 0 3px var(--primary-soft); }
-  .seg { display: grid; grid-auto-flow: column; grid-auto-columns: 1fr; gap: 6px; padding: 4px; background: var(--input-bg); border: 1px solid var(--border); border-radius: 12px; }
-  .seg input { position: absolute; opacity: 0; pointer-events: none; }
-  .seg label { text-align: center; padding: 8px 6px; border-radius: 9px; font-size: .86rem; font-weight: 600; cursor: pointer; color: var(--muted); transition: all .15s; white-space: nowrap; }
-  .seg input:checked + label { background: linear-gradient(135deg, var(--primary), var(--primary-2)); color: #fff; box-shadow: 0 4px 12px rgba(37,99,235,.28); }
-  .seg input:focus-visible + label { outline: 2px solid var(--primary); outline-offset: 2px; }
-  button.primary {
-    margin-top: 26px; width: 100%; padding: 14px 16px; font: inherit; font-weight: 600; color: #fff;
-    background: linear-gradient(135deg, var(--primary), var(--primary-2)); border: 0; border-radius: 12px; cursor: pointer;
-    transition: transform .15s, opacity .15s; display: flex; align-items: center; justify-content: center; gap: 8px;
-  }
-  button.primary:hover { transform: translateY(-1px); }
-  button.primary:disabled { opacity: .65; cursor: wait; transform: none; }
-  .spinner { width: 16px; height: 16px; border: 2px solid rgba(255,255,255,.4); border-top-color: #fff; border-radius: 50%; animation: spin .7s linear infinite; display: none; }
-  button.loading .spinner { display: inline-block; }
-  @keyframes spin { to { transform: rotate(360deg); } }
-  .placeholder { text-align: center; padding: 40px 10px; color: var(--muted); }
-  .placeholder svg { opacity: .55; margin-bottom: 10px; }
-  .result { display: none; animation: fade .35s ease; }
-  @keyframes fade { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
-  .gauge-wrap { display: flex; flex-direction: column; align-items: center; margin: 6px 0 10px; }
-  .gauge { position: relative; width: 170px; height: 170px; }
-  .gauge svg { transform: rotate(-90deg); }
-  .gauge .track { stroke: var(--track); }
-  .gauge .bar { transition: stroke-dashoffset .9s cubic-bezier(.2,.8,.2,1), stroke .3s; }
-  .gauge .center { position: absolute; inset: 0; display: grid; place-content: center; text-align: center; }
-  .gauge .pct { font-size: 2.3rem; font-weight: 700; letter-spacing: -.03em; line-height: 1; }
-  .gauge .cap { font-size: .72rem; color: var(--muted); margin-top: 4px; text-transform: uppercase; letter-spacing: .06em; font-weight: 600; }
-  .verdict { margin-top: 12px; display: inline-flex; align-items: center; gap: 8px; padding: 7px 16px; border-radius: 999px; font-weight: 700; font-size: .95rem; }
-  .tone-good { color: var(--good); } .tone-good .bar { stroke: var(--good); } .verdict.tone-good { background: var(--good-soft); }
-  .tone-mid  { color: var(--mid); }  .tone-mid .bar  { stroke: var(--mid); }  .verdict.tone-mid  { background: var(--mid-soft); }
-  .tone-bad  { color: var(--bad); }  .tone-bad .bar  { stroke: var(--bad); }  .verdict.tone-bad  { background: var(--bad-soft); }
-  .summary { margin: 16px 0 12px; padding: 14px 16px; border-radius: 12px; background: var(--primary-soft); font-size: .92rem; }
-  .insight { margin: 0 0 14px; padding: 12px 14px; border-radius: 12px; background: var(--mid-soft); color: var(--mid); font-size: .88rem; display: none; }
-  .factors { list-style: none; padding: 0; margin: 0 0 14px; display: grid; gap: 8px; }
-  .factors li { display: flex; gap: 10px; align-items: flex-start; font-size: .88rem; padding: 10px 12px; border: 1px solid var(--border); border-radius: 12px; }
-  .dot { flex: none; width: 20px; height: 20px; border-radius: 50%; display: grid; place-items: center; font-size: .72rem; font-weight: 700; color: #fff; margin-top: 1px; }
-  .dot.good { background: var(--good); } .dot.bad { background: var(--bad); } .dot.info { background: var(--primary); }
-  .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-  .stat { border: 1px solid var(--border); border-radius: 12px; padding: 10px 12px; }
-  .stat b { display: block; font-size: 1rem; }
-  .stat span { font-size: .75rem; color: var(--muted); }
-  .error { display: none; margin-top: 16px; padding: 12px 14px; border-radius: 10px; background: var(--bad-soft); color: var(--bad); font-size: .88rem; }
-  .note { margin-top: 16px; font-size: .75rem; color: var(--muted); }
-  footer { text-align: center; color: var(--muted); font-size: .78rem; margin-top: 30px; }
-</style>
-<script>
-  // Apply saved theme (or system preference) before paint to avoid flashing
-  (function () {
-    var saved = null;
-    try { saved = localStorage.getItem("theme"); } catch (e) {}
-    var dark = saved ? saved === "dark" : window.matchMedia("(prefers-color-scheme: dark)").matches;
-    document.documentElement.setAttribute("data-theme", dark ? "dark" : "light");
-  })();
-</script>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Loan eligibility check</title>
+  <meta name="description" content="Enter your application details and get an instant estimate of your loan approval chances.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=Public+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --mist: #e8edf1;
+      --paper: #ffffff;
+      --ink: #11202f;
+      --slate: #53636f;
+      --rule: #cbd5dd;
+      --cobalt: #2147c9;
+      --cobalt-dark: #183597;
+      --pine: #0f7a52;
+      --pine-tint: #e3f3ec;
+      --brick: #b23a2e;
+      --brick-tint: #f9e8e5;
+      --radius: 10px;
+      --head: "Bricolage Grotesque", "Segoe UI", system-ui, sans-serif;
+      --body: "Public Sans", "Segoe UI", system-ui, -apple-system, sans-serif;
+    }
+    *, *::before, *::after { box-sizing: border-box; }
+    html { -webkit-text-size-adjust: 100%; }
+    body {
+      margin: 0;
+      background: var(--mist);
+      color: var(--ink);
+      font-family: var(--body);
+      font-size: 1rem;
+      line-height: 1.55;
+    }
+
+    .page { width: min(1120px, 100% - 2rem); margin-inline: auto; padding-block: 2.5rem 4rem; }
+
+    header.intro { max-width: 40rem; margin-bottom: 2.25rem; }
+    h1 {
+      font-family: var(--head);
+      font-weight: 700;
+      font-size: clamp(2rem, 4.5vw, 3.1rem);
+      line-height: 1.08;
+      letter-spacing: -0.02em;
+      margin: 0 0 0.75rem;
+    }
+    header.intro p { margin: 0; color: var(--slate); font-size: 1.075rem; }
+
+    .layout { display: grid; grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr); gap: 2.5rem; align-items: start; }
+
+    /* ---------- form ---------- */
+    form { background: var(--paper); border-radius: var(--radius); padding: 0.5rem 1.75rem 1.75rem; }
+    fieldset { border: 0; margin: 0; padding: 1.5rem 0; min-width: 0; }
+    fieldset + fieldset { border-top: 1px solid var(--rule); }
+    legend {
+      font-family: var(--head);
+      font-weight: 700;
+      font-size: 1.2rem;
+      letter-spacing: -0.01em;
+      padding: 0;
+      margin-bottom: 1rem;
+    }
+    .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1.1rem 1.25rem; }
+    .field { display: flex; flex-direction: column; gap: 0.35rem; min-width: 0; }
+    .field.wide { grid-column: 1 / -1; }
+    .field > label, .field > .label { font-weight: 600; font-size: 0.925rem; }
+    .hint { color: var(--slate); font-size: 0.825rem; margin: 0; }
+    .error { color: var(--brick); font-size: 0.85rem; font-weight: 500; margin: 0; min-height: 0; }
+
+    input[type="number"], select {
+      width: 100%;
+      font: inherit;
+      color: var(--ink);
+      background: var(--paper);
+      border: 1.5px solid var(--rule);
+      border-radius: 8px;
+      padding: 0.65rem 0.8rem;
+      min-height: 2.9rem;
+      transition: border-color 0.15s;
+    }
+    input[type="number"]:hover, select:hover { border-color: #9fb0bd; }
+    .field.invalid input, .field.invalid select { border-color: var(--brick); }
+
+    :where(input, select, button, .seg label):focus-visible,
+    .seg input:focus-visible + label {
+      outline: 3px solid var(--cobalt);
+      outline-offset: 2px;
+    }
+
+    .prefix { position: relative; }
+    .prefix span {
+      position: absolute; left: 0.8rem; top: 50%; transform: translateY(-50%);
+      color: var(--slate); pointer-events: none;
+    }
+    .prefix input { padding-left: 1.8rem; }
+
+    /* segmented radio controls */
+    .seg { display: flex; border: 1.5px solid var(--rule); border-radius: 8px; overflow: hidden; }
+    .seg input { position: absolute; opacity: 0; pointer-events: none; }
+    .seg label {
+      flex: 1; text-align: center; padding: 0.65rem 0.5rem; min-height: 2.9rem;
+      display: flex; align-items: center; justify-content: center;
+      cursor: pointer; font-size: 0.95rem; line-height: 1.2;
+      border-left: 1.5px solid var(--rule);
+      transition: background 0.15s, color 0.15s;
+    }
+    .seg label:first-of-type { border-left: 0; }
+    .seg label:hover { background: var(--mist); }
+    .seg input:checked + label { background: var(--cobalt); color: #fff; font-weight: 600; }
+    .field.invalid .seg { border-color: var(--brick); }
+
+    .actions { display: flex; gap: 0.75rem; align-items: center; padding-top: 1.5rem; border-top: 1px solid var(--rule); }
+    button {
+      font: inherit; font-weight: 600; cursor: pointer; border-radius: 8px;
+      min-height: 3rem; padding: 0.7rem 1.5rem; border: 1.5px solid transparent;
+    }
+    .primary { background: var(--cobalt); color: #fff; }
+    .primary:hover { background: var(--cobalt-dark); }
+    .primary[disabled] { opacity: 0.65; cursor: progress; }
+    .ghost { background: transparent; color: var(--ink); border-color: var(--rule); }
+    .ghost:hover { background: var(--mist); }
+
+    /* ---------- decision slip ---------- */
+    .slip-wrap { position: sticky; top: 1.5rem; }
+    .slip {
+      background: var(--paper);
+      border-radius: var(--radius);
+      position: relative;
+      overflow: hidden;
+    }
+    .slip-top { padding: 1.5rem 1.75rem 1.5rem; }
+    .slip-top h2 { font-family: var(--head); font-size: 1.2rem; margin: 0; letter-spacing: -0.01em; }
+    .slip-tear {
+      position: relative; height: 0; border-top: 2px dashed var(--rule); margin: 0;
+    }
+    .slip-tear::before, .slip-tear::after {
+      content: ""; position: absolute; top: -13px; width: 24px; height: 24px; border-radius: 50%;
+      background: var(--mist);
+    }
+    .slip-tear::before { left: -12px; }
+    .slip-tear::after { right: -12px; }
+    .slip-body { padding: 1.75rem; min-height: 15rem; }
+
+    .empty p { margin: 0; color: var(--slate); }
+    .verdict {
+      font-family: var(--head); font-weight: 700; font-size: clamp(1.9rem, 3.4vw, 2.5rem);
+      line-height: 1.05; letter-spacing: -0.02em; margin: 0 0 1.25rem;
+    }
+    .state-approved .verdict { color: var(--pine); }
+    .state-declined .verdict { color: var(--brick); }
+
+    .meter-label { display: flex; justify-content: space-between; font-size: 0.9rem; font-weight: 600; margin-bottom: 0.4rem; }
+    .meter { height: 14px; background: var(--mist); border-radius: 7px; overflow: hidden; }
+    .meter > div { height: 100%; width: 0; border-radius: 7px; transition: width 0.7s cubic-bezier(.2,.7,.2,1); }
+    .state-approved .meter > div { background: var(--pine); }
+    .state-declined .meter > div { background: var(--brick); }
+    .note { color: var(--slate); font-size: 0.875rem; margin: 1.25rem 0 0; }
+    .problem { background: var(--brick-tint); color: var(--brick); border-radius: 8px; padding: 0.85rem 1rem; font-weight: 500; margin: 0; }
+
+    .spinner { width: 1.1rem; height: 1.1rem; border-radius: 50%; border: 3px solid rgba(255,255,255,.4); border-top-color: #fff; display: inline-block; vertical-align: -3px; margin-right: 0.5rem; animation: spin 0.8s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    @media (max-width: 880px) {
+      .layout { grid-template-columns: 1fr; gap: 1.5rem; }
+      .slip-wrap { position: static; }
+    }
+    @media (max-width: 520px) {
+      .page { padding-block: 1.5rem 3rem; }
+      form { padding-inline: 1.1rem; }
+      .grid { grid-template-columns: 1fr; }
+      .actions { flex-direction: column-reverse; align-items: stretch; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      * { transition: none !important; animation-duration: 0.01ms !important; }
+    }
+  </style>
 </head>
 <body>
-<div class="wrap">
-  <header>
-    <div class="brand">
-      <div class="logo">
-        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 21h18"/><path d="M5 21V10l7-6 7 6v11"/><path d="M9 21v-6h6v6"/></svg>
+  <div class="page">
+    <header class="intro">
+      <h1>See how your loan application is likely to go</h1>
+      <p>Fill in the details below. The model compares them with past applications and estimates your chance of approval in a few seconds.</p>
+    </header>
+
+    {% macro seg(name, label, options, hint=None) %}
+    <div class="field" data-field="{{ name }}">
+      <span class="label" id="{{ name }}-label">{{ label }}</span>
+      <div class="seg" role="radiogroup" aria-labelledby="{{ name }}-label">
+        {% for value, text in options %}
+          <input type="radio" id="{{ name }}-{{ loop.index }}" name="{{ name }}" value="{{ value }}" required>
+          <label for="{{ name }}-{{ loop.index }}">{{ text }}</label>
+        {% endfor %}
       </div>
-      <div>
-        <h1>Loan Approval Predictor</h1>
-        <p>Check your chances before you apply</p>
-      </div>
+      {% if hint %}<p class="hint">{{ hint }}</p>{% endif %}
+      <p class="error" data-error-for="{{ name }}" role="alert"></p>
     </div>
-    <button class="theme-btn" id="themeBtn" aria-label="Toggle theme" title="Toggle theme"></button>
-  </header>
+    {% endmacro %}
 
-  <div class="grid">
-    <form class="card" id="form" novalidate>
-      <h2>Applicant details</h2>
-      <p class="sub">Fill in the form below. It only takes a minute.</p>
+    <div class="layout">
+      <form id="loan-form" novalidate autocomplete="off">
+        <fieldset>
+          <legend>About the applicant</legend>
+          <div class="grid">
+            {{ seg("Gender", "Gender", [("Male", "Male"), ("Female", "Female")]) }}
+            {{ seg("Married", "Married", [("Yes", "Yes"), ("No", "No")]) }}
+            <div class="field" data-field="Dependents">
+              <label for="Dependents">Dependents</label>
+              <select id="Dependents" name="Dependents" required>
+                <option value="" selected disabled>Select</option>
+                <option value="0">None</option>
+                <option value="1">1</option>
+                <option value="2">2</option>
+                <option value="3+">3 or more</option>
+              </select>
+              <p class="error" data-error-for="Dependents" role="alert"></p>
+            </div>
+            {{ seg("Education", "Education", [("Graduate", "Graduate"), ("Not Graduate", "Not graduate")]) }}
+            {{ seg("Self_Employed", "Self-employed", [("Yes", "Yes"), ("No", "No")]) }}
+            <div class="field" data-field="Property_Area">
+              <label for="Property_Area">Property area</label>
+              <select id="Property_Area" name="Property_Area" required>
+                <option value="" selected disabled>Select</option>
+                <option value="Urban">Urban</option>
+                <option value="Semiurban">Semi-urban</option>
+                <option value="Rural">Rural</option>
+              </select>
+              <p class="error" data-error-for="Property_Area" role="alert"></p>
+            </div>
+          </div>
+        </fieldset>
 
-      <div class="section-title">Personal</div>
-      <div class="fields">
-        <div class="field">
-          <span class="lbl">Gender</span>
-          <div class="seg">
-            <input type="radio" name="gender" id="gM" value="male" checked><label for="gM">Male</label>
-            <input type="radio" name="gender" id="gF" value="female"><label for="gF">Female</label>
+        <fieldset>
+          <legend>Income and credit</legend>
+          <div class="grid">
+            <div class="field" data-field="ApplicantIncome">
+              <label for="ApplicantIncome">Your monthly income</label>
+              <div class="prefix"><span aria-hidden="true">₹</span>
+                <input type="number" id="ApplicantIncome" name="ApplicantIncome" min="0" step="1" inputmode="numeric" placeholder="5000" required>
+              </div>
+              <p class="error" data-error-for="ApplicantIncome" role="alert"></p>
+            </div>
+            <div class="field" data-field="CoapplicantIncome">
+              <label for="CoapplicantIncome">Co-applicant’s monthly income</label>
+              <div class="prefix"><span aria-hidden="true">₹</span>
+                <input type="number" id="CoapplicantIncome" name="CoapplicantIncome" min="0" step="1" inputmode="numeric" placeholder="0" required>
+              </div>
+              <p class="hint">Enter 0 if there is no co-applicant.</p>
+              <p class="error" data-error-for="CoapplicantIncome" role="alert"></p>
+            </div>
+            <div class="field wide">
+              {{ seg("Credit_History", "Credit history", [("1", "Meets lender guidelines"), ("0", "Does not meet guidelines")], "Choose the first option if you have repaid past loans on time.") }}
+            </div>
+          </div>
+        </fieldset>
+
+        <fieldset>
+          <legend>The loan you want</legend>
+          <div class="grid">
+            <div class="field" data-field="LoanAmount">
+              <label for="LoanAmount">Loan amount</label>
+              <div class="prefix"><span aria-hidden="true">₹</span>
+                <input type="number" id="LoanAmount" name="LoanAmount" min="1" step="1" inputmode="numeric" placeholder="150" required>
+              </div>
+              <p class="hint">In thousands. Enter 150 for ₹1,50,000.</p>
+              <p class="error" data-error-for="LoanAmount" role="alert"></p>
+            </div>
+            <div class="field" data-field="Loan_Amount_Term">
+              <label for="Loan_Amount_Term">Repayment period</label>
+              <select id="Loan_Amount_Term" name="Loan_Amount_Term" required>
+                <option value="12">1 year</option>
+                <option value="36">3 years</option>
+                <option value="60">5 years</option>
+                <option value="84">7 years</option>
+                <option value="120">10 years</option>
+                <option value="180">15 years</option>
+                <option value="240">20 years</option>
+                <option value="300">25 years</option>
+                <option value="360" selected>30 years</option>
+                <option value="480">40 years</option>
+              </select>
+              <p class="error" data-error-for="Loan_Amount_Term" role="alert"></p>
+            </div>
+          </div>
+        </fieldset>
+
+        <div class="actions">
+          <button type="submit" class="primary" id="submit-btn">Check eligibility</button>
+          <button type="reset" class="ghost" id="reset-btn">Clear form</button>
+        </div>
+      </form>
+
+      <aside class="slip-wrap" aria-label="Result">
+        <div class="slip" id="slip">
+          <div class="slip-top"><h2>Your result</h2></div>
+          <div class="slip-tear" aria-hidden="true"></div>
+          <div class="slip-body" id="slip-body" aria-live="polite">
+            <div class="empty">
+              <p>Fill in the form and select <strong>Check eligibility</strong>. Your estimate will appear here.</p>
+            </div>
           </div>
         </div>
-        <div class="field">
-          <span class="lbl">Married</span>
-          <div class="seg">
-            <input type="radio" name="married" id="mY" value="yes" checked><label for="mY">Yes</label>
-            <input type="radio" name="married" id="mN" value="no"><label for="mN">No</label>
-          </div>
-        </div>
-        <div class="field">
-          <label class="lbl" for="dependents">Dependents</label>
-          <select id="dependents" name="dependents">
-            <option value="0" selected>0</option>
-            <option value="1">1</option>
-            <option value="2">2</option>
-            <option value="3">3 or more</option>
-          </select>
-        </div>
-        <div class="field">
-          <label class="lbl" for="education">Education</label>
-          <select id="education" name="education">
-            <option value="graduate" selected>Graduate</option>
-            <option value="not_graduate">Not graduate</option>
-          </select>
-        </div>
-        <div class="field full">
-          <span class="lbl">Self-employed</span>
-          <div class="seg">
-            <input type="radio" name="self_employed" id="sN" value="no" checked><label for="sN">No</label>
-            <input type="radio" name="self_employed" id="sY" value="yes"><label for="sY">Yes</label>
-          </div>
-        </div>
-      </div>
-
-      <div class="section-title">Income</div>
-      <div class="fields">
-        <div class="field">
-          <label class="lbl" for="applicant_income">Your monthly income <small>(₹)</small></label>
-          <input type="number" id="applicant_income" name="applicant_income" min="0" max="1000000" step="1" value="5000" required>
-        </div>
-        <div class="field">
-          <label class="lbl" for="coapplicant_income">Co-applicant monthly income <small>(₹)</small></label>
-          <input type="number" id="coapplicant_income" name="coapplicant_income" min="0" max="1000000" step="1" value="0" required>
-          <div class="hint">Enter 0 if there is no co-applicant.</div>
-        </div>
-      </div>
-
-      <div class="section-title">Loan &amp; property</div>
-      <div class="fields">
-        <div class="field">
-          <label class="lbl" for="loan_amount">Loan amount <small>(in ₹ thousands)</small></label>
-          <input type="number" id="loan_amount" name="loan_amount" min="1" max="2000" step="1" value="130" required>
-          <div class="hint" id="loanHint">130 = ₹1,30,000</div>
-        </div>
-        <div class="field">
-          <label class="lbl" for="loan_term">Loan term <small>(months)</small></label>
-          <input type="number" id="loan_term" name="loan_term" min="12" max="480" step="12" value="360" required>
-          <div class="hint" id="termHint">360 months = 30 years</div>
-        </div>
-        <div class="field">
-          <label class="lbl" for="property_area">Property area</label>
-          <select id="property_area" name="property_area">
-            <option value="urban">Urban</option>
-            <option value="semiurban" selected>Semi-urban</option>
-            <option value="rural">Rural</option>
-          </select>
-        </div>
-        <div class="field">
-          <span class="lbl">Credit history</span>
-          <div class="seg">
-            <input type="radio" name="credit_history" id="cG" value="1" checked><label for="cG">Good</label>
-            <input type="radio" name="credit_history" id="cP" value="0"><label for="cP">Poor / none</label>
-          </div>
-          <div class="hint">Good = past loans/cards repaid on time.</div>
-        </div>
-      </div>
-
-      <button class="primary" id="submitBtn" type="submit">
-        <span class="spinner"></span><span id="btnText">Check approval chance</span>
-      </button>
-      <div class="error" id="error"></div>
-    </form>
-
-    <div class="card">
-      <h2>Your result</h2>
-      <p class="sub">The prediction will appear here.</p>
-
-      <div class="placeholder" id="placeholder">
-        <svg width="54" height="54" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9 12l2 2 4-4"/><circle cx="12" cy="12" r="9"/></svg>
-        <div>Complete the form and press <b>Check approval chance</b>.</div>
-      </div>
-
-      <div class="result" id="result">
-        <div class="gauge-wrap" id="gaugeWrap">
-          <div class="gauge">
-            <svg width="170" height="170" viewBox="0 0 170 170">
-              <circle class="track" cx="85" cy="85" r="72" fill="none" stroke-width="14"/>
-              <circle class="bar" id="bar" cx="85" cy="85" r="72" fill="none" stroke-width="14" stroke-linecap="round" stroke-dasharray="452.4" stroke-dashoffset="452.4"/>
-            </svg>
-            <div class="center"><div class="pct" id="pct">0%</div><div class="cap">approval chance</div></div>
-          </div>
-          <div class="verdict" id="verdict"></div>
-        </div>
-        <div class="summary" id="summary"></div>
-        <div class="insight" id="insight"></div>
-        <ul class="factors" id="factors"></ul>
-        <div class="stats">
-          <div class="stat"><b id="income"></b><span>Total monthly income</span></div>
-          <div class="stat"><b id="installment"></b><span>Loan repayment / month (before interest)</span></div>
-        </div>
-        <div class="note">This is an automated estimate from a statistical model, not a lending decision. The actual outcome depends on the lender's own checks and policies.</div>
-      </div>
+      </aside>
     </div>
   </div>
 
-  <footer>Built with Flask &amp; scikit-learn</footer>
-</div>
+  <script>
+    (function () {
+      var form = document.getElementById("loan-form");
+      var body = document.getElementById("slip-body");
+      var slip = document.getElementById("slip");
+      var btn = document.getElementById("submit-btn");
 
-<script>
-  const $ = (id) => document.getElementById(id);
-  const CIRC = 2 * Math.PI * 72;
-  const sun = '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>';
-  const moon = '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>';
+      var EMPTY = '<div class="empty"><p>Fill in the form and select <strong>Check eligibility</strong>. Your estimate will appear here.</p></div>';
 
-  function paintThemeIcon() {
-    const dark = document.documentElement.getAttribute("data-theme") === "dark";
-    $("themeBtn").innerHTML = dark ? sun : moon;
-  }
-  paintThemeIcon();
-  $("themeBtn").addEventListener("click", () => {
-    const next = document.documentElement.getAttribute("data-theme") === "dark" ? "light" : "dark";
-    document.documentElement.setAttribute("data-theme", next);
-    try { localStorage.setItem("theme", next); } catch (e) {}
-    paintThemeIcon();
-  });
+      function clearErrors() {
+        form.querySelectorAll(".field.invalid").forEach(function (f) { f.classList.remove("invalid"); });
+        form.querySelectorAll("[data-error-for]").forEach(function (e) { e.textContent = ""; });
+      }
 
-  // Indian digit grouping for hints
-  function inr(n) {
-    n = Math.round(n); let s = String(n);
-    if (s.length <= 3) return "\u20b9" + s;
-    let last3 = s.slice(-3), rest = s.slice(0, -3), g = [];
-    while (rest.length > 2) { g.unshift(rest.slice(-2)); rest = rest.slice(0, -2); }
-    if (rest) g.unshift(rest);
-    return "\u20b9" + g.concat(last3).join(",");
-  }
-  function updateHints() {
-    const la = parseFloat($("loan_amount").value), lt = parseInt($("loan_term").value, 10);
-    $("loanHint").textContent = isFinite(la) ? la + " = " + inr(la * 1000) : "";
-    if (isFinite(lt) && lt > 0) {
-      $("termHint").textContent = lt + " months" + (lt % 12 === 0 ? " = " + (lt / 12) + " year" + (lt / 12 !== 1 ? "s" : "") : "");
-    } else { $("termHint").textContent = ""; }
-  }
-  $("loan_amount").addEventListener("input", updateHints);
-  $("loan_term").addEventListener("input", updateHints);
-  updateHints();
+      function showErrors(errors) {
+        var first = null;
+        Object.keys(errors).forEach(function (name) {
+          var holder = form.querySelector('[data-error-for="' + name + '"]');
+          var field = form.querySelector('[data-field="' + name + '"]');
+          if (holder) holder.textContent = errors[name];
+          if (field) { field.classList.add("invalid"); if (!first) first = field; }
+        });
+        if (first) {
+          var target = first.querySelector("input, select");
+          if (target) target.focus({ preventScroll: true });
+          first.scrollIntoView({ behavior: "smooth", block: "center" });
+        }
+      }
 
-  function showResult(d) {
-    const tone = "tone-" + d.tone;
-    const wrap = $("gaugeWrap");
-    wrap.className = "gauge-wrap " + tone;
-    $("verdict").className = "verdict " + tone;
-    $("verdict").textContent = d.verdict;
-    $("pct").textContent = d.percent + "%";
-    $("summary").textContent = d.summary;
-    $("income").textContent = d.total_income;
-    $("installment").textContent = d.installment;
+      function localValidate(data) {
+        var errors = {};
+        ["Gender", "Married", "Education", "Self_Employed", "Credit_History"].forEach(function (k) {
+          if (!data[k]) errors[k] = "Choose an option.";
+        });
+        ["Dependents", "Property_Area"].forEach(function (k) {
+          if (!data[k]) errors[k] = "Select an option.";
+        });
+        [["ApplicantIncome", "Enter your monthly income."],
+         ["CoapplicantIncome", "Enter 0 if there is no co-applicant."],
+         ["LoanAmount", "Enter the loan amount in thousands."]].forEach(function (p) {
+          if (data[p[0]] === "" || data[p[0]] == null) errors[p[0]] = p[1];
+        });
+        return errors;
+      }
 
-    const ins = $("insight");
-    if (d.insight) { ins.textContent = d.insight; ins.style.display = "block"; } else { ins.style.display = "none"; }
+      function renderResult(result) {
+        var cls = result.approved ? "state-approved" : "state-declined";
+        var title = result.approved ? "Likely to be approved" : "Unlikely to be approved";
+        var note = result.approved
+          ? "Applications like yours were usually approved. A lender still makes the final decision."
+          : "Applications like yours were usually declined. Credit history and the loan amount you ask for have the biggest effect, so changing them may help.";
+        body.innerHTML =
+          '<div class="' + cls + '">' +
+            '<p class="verdict">' + title + '</p>' +
+            '<div class="meter-label"><span>Approval chance</span><span>' + result.probability + '%</span></div>' +
+            '<div class="meter" role="img" aria-label="Approval chance ' + result.probability + ' percent"><div></div></div>' +
+            '<p class="note">' + note + ' This is an estimate from a statistical model, not a lending decision.</p>' +
+          '</div>';
+        var bar = body.querySelector(".meter > div");
+        requestAnimationFrame(function () { requestAnimationFrame(function () { bar.style.width = result.probability + "%"; }); });
+        if (window.matchMedia("(max-width: 880px)").matches) {
+          slip.scrollIntoView({ behavior: "smooth", block: "start" });
+        }
+      }
 
-    const ul = $("factors"); ul.innerHTML = "";
-    d.factors.forEach((f) => {
-      const li = document.createElement("li");
-      const dot = document.createElement("span");
-      dot.className = "dot " + f.tone;
-      dot.textContent = f.tone === "good" ? "\u2713" : (f.tone === "bad" ? "!" : "i");
-      const t = document.createElement("span"); t.textContent = f.text;
-      li.appendChild(dot); li.appendChild(t); ul.appendChild(li);
-    });
+      function renderProblem(message) {
+        body.innerHTML = '<p class="problem">' + message + '</p>';
+      }
 
-    $("placeholder").style.display = "none";
-    const r = $("result"); r.style.display = "block";
-    r.style.animation = "none"; r.offsetHeight; r.style.animation = "";
+      form.addEventListener("submit", function (e) {
+        e.preventDefault();
+        clearErrors();
 
-    const bar = $("bar");
-    bar.style.transition = "none"; bar.style.strokeDashoffset = CIRC; bar.getBoundingClientRect();
-    bar.style.transition = "";
-    requestAnimationFrame(() => { bar.style.strokeDashoffset = CIRC * (1 - d.percent / 100); });
-    if (window.innerWidth <= 860) r.scrollIntoView({ behavior: "smooth", block: "start" });
-  }
+        var data = {};
+        new FormData(form).forEach(function (v, k) { data[k] = v; });
 
-  $("form").addEventListener("submit", async (e) => {
-    e.preventDefault();
-    const err = $("error"); err.style.display = "none";
-    const btn = $("submitBtn");
-    btn.disabled = true; btn.classList.add("loading"); $("btnText").textContent = "Checking...";
+        var errors = localValidate(data);
+        if (Object.keys(errors).length) {
+          showErrors(errors);
+          renderProblem("Some answers are missing. Complete the highlighted fields and try again.");
+          return;
+        }
 
-    const payload = {};
-    new FormData($("form")).forEach((v, k) => payload[k] = v);
+        btn.disabled = true;
+        btn.innerHTML = '<span class="spinner" aria-hidden="true"></span>Checking';
 
-    try {
-      const res = await fetch("/predict", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload)
+        fetch("/predict", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(data)
+        })
+          .then(function (res) { return res.json().then(function (json) { return { status: res.status, json: json }; }); })
+          .then(function (r) {
+            if (r.json.ok) { renderResult(r.json); }
+            else if (r.json.errors) {
+              showErrors(r.json.errors);
+              renderProblem("Some answers need fixing. Check the highlighted fields and try again.");
+            } else { renderProblem(r.json.message || "Something went wrong. Try again in a moment."); }
+          })
+          .catch(function () { renderProblem("Could not reach the server. Check your connection and try again."); })
+          .then(function () { btn.disabled = false; btn.textContent = "Check eligibility"; });
       });
-      const data = await res.json();
-      if (!res.ok || !data.ok) throw new Error(data.error || "Something went wrong.");
-      showResult(data);
-    } catch (ex) {
-      err.textContent = ex.message; err.style.display = "block";
-    } finally {
-      btn.disabled = false; btn.classList.remove("loading"); $("btnText").textContent = "Check approval chance";
-    }
-  });
-</script>
+
+      form.addEventListener("reset", function () {
+        clearErrors();
+        body.innerHTML = EMPTY;
+      });
+    })();
+  </script>
 </body>
 </html>
 """
 
 
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------- #
 # Routes
-# ---------------------------------------------------------------------------
-@app.route("/")
-def home():
-    return HTML
+# --------------------------------------------------------------------------- #
+@app.get("/")
+def index():
+    return render_template_string(PAGE)
 
 
-@app.route("/health")
-def health():
-    return jsonify(status="ok")
-
-
-@app.route("/predict", methods=["POST"])
+@app.post("/predict")
 def predict():
-    data = request.get_json(silent=True) or request.form.to_dict()
-
-    def number(key, label, lo, hi):
-        try:
-            val = float(data.get(key))
-        except (TypeError, ValueError):
-            raise ValueError(f"Please enter a valid number for '{label}'.")
-        if not (lo <= val <= hi):
-            raise ValueError(f"'{label}' must be between {lo:g} and {hi:g}.")
-        return val
+    payload = request.get_json(silent=True) or request.form.to_dict()
+    row, errors = parse_payload(payload)
+    if errors:
+        return jsonify({"ok": False, "errors": errors}), 400
 
     try:
-        app_income = number("applicant_income", "Your monthly income", 0, 1_000_000)
-        co_income = number("coapplicant_income", "Co-applicant income", 0, 1_000_000)
-        loan_amount = number("loan_amount", "Loan amount", 1, 2000)
-        loan_term = number("loan_term", "Loan term", 12, 480)
-    except ValueError as e:
-        return jsonify(ok=False, error=str(e)), 400
+        frame = pd.DataFrame([row], columns=FEATURE_ORDER)
+        approved_index = list(model.classes_).index(1)
+        probability = float(model.predict_proba(frame)[0][approved_index])
+        approved = bool(model.predict(frame)[0] == 1)
+    except Exception:  # pragma: no cover - unexpected model failure
+        log.exception("Prediction failed")
+        return jsonify({"ok": False, "message": "The model could not score this application."}), 500
 
-    gender = str(data.get("gender", "")).lower()
-    married = str(data.get("married", "")).lower()
-    education = str(data.get("education", "")).lower()
-    self_emp = str(data.get("self_employed", "")).lower()
-    area = str(data.get("property_area", "")).lower()
-    dependents = str(data.get("dependents", "")).strip()
-    credit = str(data.get("credit_history", "")).strip()
+    return jsonify({
+        "ok": True,
+        "approved": approved,
+        "probability": round(probability * 100, 1),
+    })
 
-    if (
-        gender not in GENDER_MAP
-        or married not in MARRIED_MAP
-        or education not in EDUCATION_MAP
-        or self_emp not in SELF_EMP_MAP
-        or area not in AREA_MAP
-        or dependents not in DEPENDENTS_ALLOWED
-        or credit not in {"0", "1"}
-    ):
-        return jsonify(ok=False, error="Please check that every option in the form is selected."), 400
 
-    def build_row(credit_value):
-        return [
-            GENDER_MAP[gender],
-            MARRIED_MAP[married],
-            int(dependents),
-            EDUCATION_MAP[education],
-            SELF_EMP_MAP[self_emp],
-            app_income,
-            co_income,
-            loan_amount,
-            loan_term,
-            int(credit_value),
-            AREA_MAP[area],
-        ]
+@app.get("/health")
+def health():
+    """Health-check endpoint for AWS load balancers / Elastic Beanstalk."""
+    return jsonify({"status": "ok"}), 200
 
-    prob = approval_probability(build_row(credit))
-    percent = int(round(prob * 100))
 
-    if prob >= 0.75:
-        verdict, tone = "Strong chance of approval", "good"
-    elif prob >= 0.50:
-        verdict, tone = "Likely to be approved", "good"
-    elif prob >= 0.35:
-        verdict, tone = "Approval is uncertain", "mid"
-    else:
-        verdict, tone = "Unlikely to be approved", "bad"
-
-    # ---- plain-language summary -------------------------------------------
-    total_income = app_income + co_income
-    loan_rupees = loan_amount * 1000
-    months = int(loan_term)
-    installment = loan_rupees / months
-
-    pct_article = "an" if percent in (8, 11, 18) or 80 <= percent <= 89 else "a"
-    dep_txt = {"0": "no dependents", "1": "1 dependent", "2": "2 dependents", "3": "3 or more dependents"}[dependents]
-    summary = (
-        f"For a {'married' if married == 'yes' else 'single'} {gender} "
-        f"{'graduate' if education == 'graduate' else 'non-graduate'} applicant "
-        f"({'self-employed' if self_emp == 'yes' else 'salaried / not self-employed'}) with {dep_txt}, "
-        f"a total household income of {money(total_income)} per month, applying for "
-        f"{money_words(loan_rupees)} over {term_text(months)} on a property in a "
-        f"{AREA_NAME[area]} area with {'a good' if credit == '1' else 'a poor or no'} credit history, "
-        f"the model estimates {pct_article} {percent}% chance of approval."
-    )
-
-    # ---- what-if insight on credit history --------------------------------
-    insight = ""
-    if credit == "0":
-        alt = approval_probability(build_row(1))
-        if alt - prob > 0.02:
-            insight = (
-                f"Credit history matters most. With a good credit history, your estimated "
-                f"chance would rise from {percent}% to about {int(round(alt * 100))}%."
-            )
-    else:
-        alt = approval_probability(build_row(0))
-        if prob - alt > 0.02:
-            insight = (
-                f"Your good credit history is helping a lot. Without it, the estimated "
-                f"chance would drop to about {int(round(alt * 100))}%."
-            )
-
-    # ---- key factors (simple, readable hints) -----------------------------
-    factors = []
-    if credit == "1":
-        factors.append({"tone": "good", "text": "Good credit history is the strongest positive signal for lenders."})
-    else:
-        factors.append({"tone": "bad", "text": "A poor or missing credit history is the biggest reason for rejection. Building a clean repayment record can help."})
-
-    if total_income > 0:
-        burden = installment / total_income
-        if burden <= 0.30:
-            factors.append({"tone": "good", "text": f"The monthly repayment ({money(installment)}) is a small part of your income, which is comfortable."})
-        elif burden <= 0.50:
-            factors.append({"tone": "info", "text": f"The monthly repayment ({money(installment)}) is a moderate share of your income."})
-        else:
-            factors.append({"tone": "bad", "text": f"The monthly repayment ({money(installment)}) is a large share of your income. A smaller loan or longer term may help."})
-    else:
-        factors.append({"tone": "bad", "text": "No income was entered, which makes approval very unlikely."})
-
-    if co_income > 0:
-        factors.append({"tone": "good", "text": "Having a co-applicant with income strengthens the application."})
-    elif prob < 0.6:
-        factors.append({"tone": "info", "text": "Adding a co-applicant with income could improve the application."})
-
-    return jsonify(
-        ok=True,
-        percent=percent,
-        verdict=verdict,
-        tone=tone,
-        summary=summary,
-        insight=insight,
-        factors=factors,
-        total_income=money(total_income),
-        installment=money(installment),
-    )
+@app.after_request
+def security_headers(response):
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    return response
 
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
